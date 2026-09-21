@@ -1,19 +1,30 @@
 from pathlib import Path
 from urllib.parse import urljoin
+import json
 import time
 
 import requests
 from bs4 import BeautifulSoup
+from pydantic import ValidationError
 
+from models import Book
 
 URL = "https://books.toscrape.com/catalogue/page-1.html"
 
 CACHE_DIR = Path("cache")
+OUTPUT_DIR = Path("output")
 
 HEADERS = {
     "User-Agent": "FlyRankInternshipA9/1.0 (+https://github.com/danelleSchlebusch/web-scraping-pipeline.git)"
 }
 
+def normalize_price(price_text: str) -> float:
+    return float(price_text.replace("£", "").strip())
+
+BASE_URL = "https://books.toscrape.com/"
+
+def normalize_url(product_url: str) -> str:
+    return urljoin(BASE_URL, product_url)
 
 def fetch_and_cache(url):
     if "page-" in url:
@@ -148,11 +159,45 @@ def extract_book_details(book):
 if __name__ == "__main__":
     books = discover_catalogue()
 
-    detail_records = []
+    detail_records = {}
+    errors = []
 
     for book in books:
-        record = extract_book_details(book)
-        detail_records.append(record)
+        try:
+            record = extract_book_details(book)
 
-    print(detail_records[0])
-    print(f"detail_pages={len(detail_records)}")
+            record["price_gbp"] = normalize_price(record["price_text"])
+            record["product_url"] = normalize_url(record["product_url"])
+            record["source_page"] = normalize_url(record["source_page"])
+
+            validated_book = Book(**record)
+
+            detail_records[validated_book.product_url] = validated_book
+
+        except ValidationError as error:
+            errors.append({
+                "product_url": book["product_url"],
+                "reason": error.errors()
+            })
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    books_output = [
+        book.model_dump(mode="json")
+        for book in detail_records.values()
+    ]
+
+    books_file = OUTPUT_DIR / "books.json"
+    books_file.write_text(
+        json.dumps(books_output, indent=2),
+        encoding="utf-8"
+    )
+
+    errors_file = OUTPUT_DIR / "errors.json"
+    errors_file.write_text(
+        json.dumps(errors, indent=2),
+        encoding="utf-8"
+    )
+
+    print(f"valid_records={len(detail_records)}")
+    print(f"errors={len(errors)}")
