@@ -16,7 +16,12 @@ HEADERS = {
 
 
 def fetch_and_cache(url):
-    page_name = url.rstrip("/").split("/")[-1]
+    if "page-" in url:
+        page_name = url.rstrip("/").split("/")[-1]
+    else:
+        product_id = url.rstrip("/").split("/")[-2].split("_")[-1]
+        page_name = f"detail-{product_id}.html"
+
     cache_file = CACHE_DIR / page_name
 
     if cache_file.exists():
@@ -35,7 +40,7 @@ def fetch_and_cache(url):
             f"Fetch failed with status code {response.status_code}"
         )
 
-    html = response.text
+    html = response.content.decode("utf-8")
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_file.write_text(html, encoding="utf-8")
@@ -50,7 +55,7 @@ def discover_catalogue():
     page_url = URL
 
     catalogue_pages = 0
-    discovered_urls = []
+    discovered_books = []
     seen_urls = set()
 
     while page_url and catalogue_pages < 3:
@@ -65,7 +70,14 @@ def discover_catalogue():
 
             if href:
                 book_url = urljoin(page_url, href)
-                discovered_urls.append(book_url)
+
+                if book_url not in seen_urls:
+                    seen_urls.add(book_url)
+
+                    discovered_books.append({
+                    "product_url": book_url,
+                    "source_page": page_url
+                    })
 
         next_link = soup.select_one("li.next a")
 
@@ -75,14 +87,72 @@ def discover_catalogue():
         else:
             page_url = None
 
-    for url in discovered_urls:
-        seen_urls.add(url)
-
     print(f"catalogue_pages={catalogue_pages}")
-    print(f"discovered={len(discovered_urls)}")
+    print(f"discovered={len(discovered_books)}")
     print(f"unique_urls={len(seen_urls)}")
 
-    return seen_urls
+    return discovered_books
+
+def extract_book_details(book):
+    html = fetch_and_cache(book["product_url"])
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    product = soup.select_one("article.product_page")
+
+    if product is None:
+        raise RuntimeError(
+            f"Product area not found: {book['product_url']}"
+        )
+
+    title = product.select_one("h1")
+    price = product.select_one(".price_color")
+    availability = product.select_one(".availability")
+    rating = product.select_one("p.star-rating")
+
+    description = product.select_one("#product_description + p")
+
+    rating_text = None
+
+    if rating:
+        rating_classes = rating.get("class", [])
+
+        for rating_class in rating_classes:
+            if rating_class != "star-rating":
+                rating_text = rating_class
+                break
+
+    description_text = None
+
+    if description:
+        description_text = description.get_text(strip=True)
+
+    return {
+        "title": title.get_text(strip=True) if title else None,
+        "product_url": book["product_url"],
+        "price_text": price.get_text(strip=True) if price else None,
+        "availability_text": (
+            availability.get_text(" ", strip=True)
+            if availability
+            else None
+        ),
+        "rating_text": rating_text,
+        "description": description_text,
+        "source_page": book["source_page"],
+        "fetched_at": time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+            time.gmtime()
+        )
+    }
 
 if __name__ == "__main__":
-    discover_catalogue()
+    books = discover_catalogue()
+
+    detail_records = []
+
+    for book in books:
+        record = extract_book_details(book)
+        detail_records.append(record)
+
+    print(detail_records[0])
+    print(f"detail_pages={len(detail_records)}")
