@@ -26,7 +26,7 @@ BASE_URL = "https://books.toscrape.com/"
 def normalize_url(product_url: str) -> str:
     return urljoin(BASE_URL, product_url)
 
-def fetch_and_cache(url):
+def fetch_and_cache(url, stats):
     if "page-" in url:
         page_name = url.rstrip("/").split("/")[-1]
     else:
@@ -37,32 +37,75 @@ def fetch_and_cache(url):
 
     if cache_file.exists():
         html = cache_file.read_text(encoding="utf-8")
+        stats["cache_hits"] += 1
+
         print(f"CACHE HIT — {page_name} — {len(html)} bytes")
         return html
 
-    response = requests.get(
-        url,
-        headers=HEADERS,
-        timeout=5
-    )
+    attempts = 2
 
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"Fetch failed with status code {response.status_code}"
-        )
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(
+                url,
+                headers=HEADERS,
+                timeout=5
+            )
 
-    html = response.content.decode("utf-8")
+            if response.status_code == 200:
+                html = response.content.decode("utf-8")
 
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_file.write_text(html, encoding="utf-8")
+                CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                cache_file.write_text(html, encoding="utf-8")
 
-    print(f"FETCH — {page_name} — {len(html)} bytes")
+                stats["pages_fetched"] += 1
 
-    time.sleep(0.5)
+                print(f"FETCH — {page_name} — {len(html)} bytes")
 
-    return html
+                time.sleep(0.5)
 
-def discover_catalogue():
+                return html
+
+            if response.status_code == 404:
+                raise RuntimeError(
+                    f"Fetch failed with status code 404"
+                )
+
+            if response.status_code == 403:
+                raise RuntimeError(
+                    f"Fetch failed with status code 403"
+                )
+
+            if 500 <= response.status_code <= 599:
+                if attempt == 1:
+                    print(
+                        f"SERVER ERROR {response.status_code} — "
+                        f"retrying {page_name}"
+                    )
+                    time.sleep(1)
+                    continue
+
+                raise RuntimeError(
+                    f"Fetch failed with status code {response.status_code}"
+                )
+
+            raise RuntimeError(
+                f"Fetch failed with status code {response.status_code}"
+            )
+
+        except requests.Timeout:
+            if attempt == 1:
+                print(
+                    f"TIMEOUT — retrying {page_name}"
+                )
+                time.sleep(1)
+                continue
+
+            raise RuntimeError(
+                f"Fetch timed out after {attempts} attempts"
+            )
+
+def discover_catalogue(stats):
     page_url = URL
 
     catalogue_pages = 0
@@ -70,33 +113,43 @@ def discover_catalogue():
     seen_urls = set()
 
     while page_url and catalogue_pages < 3:
-        html = fetch_and_cache(page_url)
+        try:
+            html = fetch_and_cache(page_url, stats)
 
-        soup = BeautifulSoup(html, "html.parser")
+            soup = BeautifulSoup(html, "html.parser")
 
-        catalogue_pages += 1
+            catalogue_pages += 1
 
-        for link in soup.select("article.product_pod h3 a"):
-            href = link.get("href")
+            for link in soup.select("article.product_pod h3 a"):
+                href = link.get("href")
 
-            if href:
-                book_url = urljoin(page_url, href)
+                if href:
+                    book_url = urljoin(page_url, href)
 
-                if book_url not in seen_urls:
-                    seen_urls.add(book_url)
+                    if book_url not in seen_urls:
+                        seen_urls.add(book_url)
 
-                    discovered_books.append({
-                    "product_url": book_url,
-                    "source_page": page_url
-                    })
+                        discovered_books.append({
+                            "product_url": book_url,
+                            "source_page": page_url
+                        })
 
-        next_link = soup.select_one("li.next a")
+            next_link = soup.select_one("li.next a")
 
-        if next_link:
-            next_href = next_link.get("href")
-            page_url = urljoin(page_url, next_href)
-        else:
-            page_url = None
+            if next_link:
+                next_href = next_link.get("href")
+                page_url = urljoin(page_url, next_href)
+            else:
+                page_url = None
+
+        except Exception as error:
+            stats["failed_pages"] += 1
+
+            print(
+                f"FAILED CATALOGUE PAGE — {page_url} — {error}"
+            )
+
+            break
 
     print(f"catalogue_pages={catalogue_pages}")
     print(f"discovered={len(discovered_books)}")
@@ -104,8 +157,8 @@ def discover_catalogue():
 
     return discovered_books
 
-def extract_book_details(book):
-    html = fetch_and_cache(book["product_url"])
+def extract_book_details(book, stats):
+    html = fetch_and_cache(book["product_url"], stats)
 
     soup = BeautifulSoup(html, "html.parser")
 
@@ -157,14 +210,24 @@ def extract_book_details(book):
     }
 
 if __name__ == "__main__":
-    books = discover_catalogue()
+    start_time = time.time()
+
+    stats = {
+        "pages_fetched": 0,
+        "cache_hits": 0,
+        "valid_records": 0,
+        "invalid_records": 0,
+        "failed_pages": 0
+    }
+
+    books = discover_catalogue(stats)
 
     detail_records = {}
     errors = []
 
     for book in books:
         try:
-            record = extract_book_details(book)
+            record = extract_book_details(book, stats)
 
             record["price_gbp"] = normalize_price(record["price_text"])
             record["product_url"] = normalize_url(record["product_url"])
@@ -175,10 +238,24 @@ if __name__ == "__main__":
             detail_records[validated_book.product_url] = validated_book
 
         except ValidationError as error:
+            stats["invalid_records"] += 1
+
             errors.append({
                 "product_url": book["product_url"],
                 "reason": error.errors()
             })
+
+        except Exception as error:
+            stats["failed_pages"] += 1
+
+            errors.append({
+                "product_url": book["product_url"],
+                "reason": str(error)
+            })
+
+            print(
+                f"FAILED — {book['product_url']} — {error}"
+            )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -199,5 +276,30 @@ if __name__ == "__main__":
         encoding="utf-8"
     )
 
-    print(f"valid_records={len(detail_records)}")
-    print(f"errors={len(errors)}")
+    duration = time.time() - start_time
+
+    stats["valid_records"] = len(detail_records)
+
+    run_report = {
+        "start_time": time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+            time.gmtime(start_time)
+        ),
+        "duration": round(duration, 2),
+        "pages_fetched": stats["pages_fetched"],
+        "cache_hits": stats["cache_hits"],
+        "valid_records": stats["valid_records"],
+        "invalid_records": stats["invalid_records"],
+        "failed_pages": stats["failed_pages"]
+    }
+
+    run_report_file = OUTPUT_DIR / "run-report.json"
+
+    run_report_file.write_text(
+        json.dumps(run_report, indent=2),
+        encoding="utf-8"
+    )
+
+    print(f"valid_records={stats['valid_records']}")
+    print(f"invalid_records={stats['invalid_records']}")
+    print(f"failed_pages={stats['failed_pages']}")
